@@ -64,7 +64,7 @@ def _extract_chat_info(body):
                     chat_type = "private"
                 else:
                     chat_type = "group"
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
         pass
     return chat_id, chat_type
 
