@@ -1,0 +1,10 @@
+services:
+  telegram-proxy:
+    build: .
+    container_name: telegram-proxy
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./data:/data
