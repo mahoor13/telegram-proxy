@@ -1,156 +1,316 @@
-# telegram-proxy
+# Telegram Gateway and Social Outbound Relay
 
-Two-in-one Telegram proxy service behind Nginx Proxy Manager.
+This service provides three independent capabilities:
 
-## Features
+1. A synchronous Telegram Bot API reverse proxy.
+2. An inbound Telegram webhook relay.
+3. A signed, allowlisted outbound relay for social providers such as YouTube
+   and Telegram.
 
-- **API Proxy** — proxies any request to `api.telegram.org`. Request flow is controlled by the `X-Bypass-Queue` header:
-  - **Without the header (default):** request is enqueued, processed asynchronously with rate-limit compliance, and Telegram's 429 `retry_after` is honoured automatically. Returns `202 Accepted` with a tracking ID.
-  - **With `X-Bypass-Queue: true`:** request is forwarded synchronously and the real Telegram response is returned immediately.
-  - **GET/HEAD requests** always bypass the queue (they are not subject to message rate limits).
-- **Webhook Hook** — `POST /hook` receives Telegram bot webhook updates and synchronously forwards them to `HOOK_ENDPOINT`.
+The outbound relay is an application-level relay, not an HTTP CONNECT or SOCKS
+forward proxy. Laravel sends the original destination in signed `X-Relay-*`
+headers and receives the real upstream response synchronously.
+
+## Request flows
+
+```text
+Telegram reverse proxy:
+Laravel -> /bot<TOKEN>/<method> -> api.telegram.org
+
+Telegram webhook:
+Telegram -> /hook -> Laravel webhook endpoint
+
+Social relay:
+Laravel -> /relay -> allowlisted provider endpoint
+```
 
 ## Setup
 
-1. Clone and enter the directory.
-
-2. Create a `data/` directory for the SQLite queue:
+Create `.env` from the example:
 
 ```bash
-mkdir -p data
+cp .env.example .env
+docker compose up -d --build
 ```
 
-3. Copy `.env` and fill in your values:
+The service binds to `127.0.0.1:5000` by default.
+
+Never commit real bot tokens, relay keys, or relay secrets. Telegram bot tokens
+appear in Bot API URL paths, so access logging is disabled in Gunicorn and must
+also be disabled or redacted at Nginx Proxy Manager.
+
+## Optional service-scoped V2Ray proxy
+
+To route only this container's outbound traffic through a V2Ray mixed or SOCKS
+listener on the Docker host, configure:
+
+```env
+TELEGRAM_PROXY_OUTBOUND_PROXY_URL=socks5h://host.docker.internal:10808
+TELEGRAM_PROXY_OUTBOUND_PROXY_BYPASS_HOSTS=api,localhost,127.0.0.1
+```
+
+The root Compose file maps this value to `OUTBOUND_PROXY_URL` only inside the
+`telegram-proxy` container. It is not injected into Laravel, Portal, or other
+containers. `socks5h` is preferred because provider DNS resolution also occurs
+through V2Ray.
+
+Exact hosts in `TELEGRAM_PROXY_OUTBOUND_PROXY_BYPASS_HOSTS` bypass V2Ray. The
+default keeps the internal webhook hop from `telegram-proxy` to Laravel on the
+Docker network while external provider requests still use V2Ray.
+
+The Compose service includes the Linux `host-gateway` mapping required for
+`host.docker.internal`. The V2Ray listener must accept connections on the
+Docker host interface, not only an inaccessible loopback socket.
+
+The root health check terminates Gunicorn if its HTTP worker stops responding.
+Combined with `restart: unless-stopped`, this recovers the service instead of
+leaving a master process alive indefinitely in Docker's `unhealthy` state.
+
+## Secure outbound relay
+
+Enable the relay and configure credentials:
+
+```env
+RELAY_ENABLED=true
+RELAY_PATH=/relay
+RELAY_KEY=replace-with-a-random-application-key
+RELAY_SECRET=replace-with-at-least-32-random-bytes
+RELAY_CLOCK_SKEW=60
+RELAY_CONNECT_TIMEOUT=15
+RELAY_READ_TIMEOUT=1800
+RELAY_ALLOW_HTTP=false
+GUNICORN_TIMEOUT=1900
+```
+
+Configure exact upstream host allowlists per provider:
+
+```env
+RELAY_ALLOWED_HOSTS_YOUTUBE=oauth2.googleapis.com,www.googleapis.com
+RELAY_ALLOWED_HOSTS_TELEGRAM=api.telegram.org
+RELAY_ALLOWED_HOSTS_WHATSAPP=graph.facebook.com
+```
+
+An empty allowlist denies every target for that provider.
+
+### Relay protocol
+
+Laravel sends requests to `/relay` with:
+
+```text
+X-Relay-Provider
+X-Relay-Target
+X-Relay-Key
+X-Relay-Timestamp
+X-Relay-Nonce
+X-Relay-Content-SHA256
+X-Relay-Signature
+```
+
+The canonical HMAC payload is:
+
+```text
+METHOD
+provider
+absolute-target-url
+timestamp
+nonce
+UNSIGNED-PAYLOAD
+```
+
+`X-Relay-Signature` is the lowercase hexadecimal HMAC-SHA256 of that canonical
+text using `RELAY_SECRET`.
+
+The request body uses the `UNSIGNED-PAYLOAD` marker so large and resumable
+uploads can stream without being buffered for hashing. TLS protects body
+integrity in transit; HMAC authenticates the caller, provider, method, target,
+timestamp, and nonce.
+
+### Relay security
+
+The relay:
+
+- accepts only configured application credentials;
+- rejects expired timestamps and repeated nonces;
+- only accepts known provider names;
+- only accepts exact hosts in that provider's allowlist;
+- permits HTTPS only by default;
+- rejects credentials embedded in target URLs;
+- rejects non-standard target ports;
+- resolves and rejects private, loopback, link-local, multicast, and otherwise
+  non-public destination addresses;
+- never follows upstream redirects automatically;
+- strips relay authentication and forwarding headers before contacting the
+  upstream;
+- disables environment-derived proxies in its outbound HTTP session;
+- does not queue or automatically retry unsafe requests.
+
+The nonce store is process-local. Keep the configured single Gunicorn worker.
+If the service is scaled to multiple workers or replicas, replace it with a
+shared Redis-backed nonce store before scaling.
+
+## Nginx Proxy Manager
+
+Create a Proxy Host that forwards to:
+
+```text
+http://telegram-proxy:5000
+```
+
+Enable SSL. The public Relay URL used by Laravel must be HTTPS.
+
+For YouTube video uploads, configure the front proxy for streaming and long
+timeouts. Equivalent Nginx settings:
+
+```nginx
+client_max_body_size 0;
+proxy_request_buffering off;
+proxy_buffering off;
+proxy_read_timeout 1800s;
+proxy_send_timeout 1800s;
+```
+
+Do not log full request paths or sensitive headers.
+
+## Laravel configuration
+
+Example:
+
+```env
+SOCIAL_RELAY_URL=https://relay.example.com/relay
+SOCIAL_RELAY_KEY=the-same-value-as-RELAY_KEY
+SOCIAL_RELAY_SECRET=the-same-value-as-RELAY_SECRET
+SOCIAL_RELAY_ALLOW_HTTP=false
+
+YOUTUBE_EGRESS_MODE=relay
+TELEGRAM_EGRESS_MODE=relay
+
+EITAA_EGRESS_MODE=none
+RUBIKA_EGRESS_MODE=none
+BALE_EGRESS_MODE=none
+```
+
+Merely setting `SOCIAL_RELAY_URL`, `SOCIAL_DIRECT_PROXY_URL`, or `HTTP_TUNNEL`
+does not enable either transport. Every provider must explicitly select
+`none`, `direct`, or `relay`.
+
+## Telegram synchronous reverse proxy
+
+Configure:
 
 ```env
 API_BASE_URL=https://api.telegram.org
-HOOK_ENDPOINT=https://your-site.com/api/v1/telegram-hook
-HOOK_SECRET_TOKEN=your-telegram-webhook-secret
-ALLOWED_TOKENS=bot123456:ABC-def,bot789012:GHI-jkl
-HOST=0.0.0.0
-PORT=5000
+ALLOWED_TOKENS=123456789:token-without-the-bot-prefix
+```
 
+Requests preserve the Telegram API path:
+
+```text
+POST /bot<TOKEN>/sendMessage
+GET  /file/bot<TOKEN>/<file-path>
+```
+
+Requests are synchronous by default and return Telegram's real status, headers,
+and body. This is compatible with clients that require Telegram's
+`{"ok":true,"result":...}` response.
+
+Leaving `ALLOWED_TOKENS` empty permits all Telegram bot tokens and is not
+recommended on a publicly reachable service.
+
+## Optional legacy Telegram queue
+
+The SQLite queue is retained for callers that explicitly need it, but it is
+disabled by default:
+
+```env
+QUEUE_ENABLED=true
 QUEUE_DB_PATH=/data/queue.db
 MAX_RETRIES=8
 WORKER_POLL_INTERVAL=0.1
 WORKER_BATCH_SIZE=10
-
-RATE_LIMIT_GLOBAL=28
-RATE_LIMIT_CHAT_PRIVATE=1
-RATE_LIMIT_CHAT_GROUP=20
-RATE_LIMIT_CHAT_GROUP_WINDOW=60
 ```
 
-4. Start the service:
+A caller must explicitly send:
 
-```bash
-docker compose up -d --build
+```text
+X-Queue-Request: true
 ```
 
-The service listens on `127.0.0.1:5000`.
+The response is:
 
-## Rate Limiting
+```json
+{
+  "status": "queued",
+  "id": "uuid"
+}
+```
 
-The queue worker enforces three token-bucket rate limiters before every outbound call:
+Check status at:
 
-| Scope | Limit |
-|---|---|
-| Global (bot-wide) | 28 messages/second |
-| Private chat | 1 message/second |
-| Group / supergroup | 20 messages/minute |
+```text
+GET /status/<uuid>
+```
 
-When Telegram responds with `429` and a `retry_after` value, the worker waits exactly that duration plus a random jitter (0–500 ms) before retrying. Network and server errors use exponential backoff. Items that exceed `MAX_RETRIES` are marked as `failed`.
+Do not enable this queue for Laravel social publishing. Laravel already queues
+publishing jobs and requires the real provider response.
 
-## Nginx Proxy Manager
+## Telegram webhook relay
 
-1. Add a **Proxy Host**.
-2. Domain: your domain (e.g. `tg-proxy.example.com`).
-3. Forward to `http://telegram-proxy:5000`.
-4. Enable SSL if desired.
-
-## Security
-
-### API Proxy — Token Whitelist
-
-Set `ALLOWED_TOKENS` with a comma-separated list of bot tokens that are allowed through the proxy:
+Configure:
 
 ```env
-ALLOWED_TOKENS=bot123456:ABC-def,bot789012:GHI-jkl
+HOOK_ENDPOINT=https://admin.example.com/api/v1/telegram/webhook
+HOOK_SECRET_TOKEN=the-secret-used-with-setWebhook
 ```
 
-Requests for tokens not in this list get a `403 Forbidden`. Leave `ALLOWED_TOKENS` empty to allow all tokens (not recommended).
+Register:
 
-### Webhook Hook — Telegram Secret Token
+```text
+https://relay.example.com/hook
+```
 
-Set `HOOK_SECRET_TOKEN` to the same value you pass as `secret_token` to `setWebhook`:
+Incoming requests must include the matching
+`X-Telegram-Bot-Api-Secret-Token` header.
+
+## Health check
+
+```text
+GET /health
+```
+
+Response:
+
+```json
+{"status":"ok"}
+```
+
+The Docker Compose service includes a health check for this endpoint.
+
+## Tests
+
+Build the image:
 
 ```bash
-curl -F "url=https://tg-proxy.example.com/hook" \
-     -F "secret_token=your-telegram-webhook-secret" \
-     https://api.telegram.org/bot<TOKEN>/setWebhook
+docker build -t telegram-proxy:test .
 ```
 
-If the incoming `X-Telegram-Bot-Api-Secret-Token` header doesn't match, the request is rejected with `403`.
-
-## Usage
-
-### API Proxy (queue mode — default)
-
-```python
-import requests
-
-resp = requests.post(
-    "https://tg-proxy.example.com/bot<TOKEN>/sendMessage",
-    json={"chat_id": 12345, "text": "Hello"},
-)
-# resp.status_code == 202
-# resp.json() == {"status": "queued", "id": "uuid-here"}
-```
-
-Check delivery status:
+Run tests:
 
 ```bash
-curl https://tg-proxy.example.com/status/<uuid>
-# {"id": "...", "status": "delivered", "attempt": 0}
+docker run --rm \
+  -v "$PWD/tests:/tests:ro" \
+  --entrypoint python \
+  telegram-proxy:test \
+  -m unittest discover -s /tests -v
 ```
 
-### API Proxy (bypass mode — synchronous)
+Tests cover:
 
-Add the `X-Bypass-Queue: true` header to get the real Telegram response immediately:
-
-```python
-resp = requests.post(
-    "https://tg-proxy.example.com/bot<TOKEN>/sendMessage",
-    json={"chat_id": 12345, "text": "Hello"},
-    headers={"X-Bypass-Queue": "true"},
-)
-# resp.status_code == 200  (real Telegram response)
-```
-
-GET and HEAD requests always bypass the queue.
-
-### Webhook Hook
-
-Point your Telegram bot's webhook to:
-
-```
-https://tg-proxy.example.com/hook
-```
-
-The incoming update (headers + body) is synchronously forwarded to `HOOK_ENDPOINT` and the upstream response is relayed back.
-
-## Project Structure
-
-```
-.
-├── docker-compose.yaml
-├── Dockerfile
-├── .env
-├── data/                  # SQLite queue storage (auto-created)
-└── app/
-    ├── main.py
-    ├── msgqueue.py
-    ├── ratelimiter.py
-    ├── worker.py
-    └── requirements.txt
-```
+- synchronous Telegram forwarding;
+- Telegram API/file token extraction;
+- explicit queue activation;
+- valid relay forwarding;
+- HMAC rejection;
+- replay rejection;
+- provider host allowlists;
+- private destination rejection;
+- disabled relay behavior.

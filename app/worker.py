@@ -7,6 +7,7 @@ import threading
 
 import requests
 from msgqueue import dequeue_ready, mark_delivered, mark_failed, reschedule
+from outbound import outbound_proxies
 from ratelimiter import RateLimiterSet
 
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 8))
@@ -62,6 +63,7 @@ class DeliveryWorker(threading.Thread):
                 url=url,
                 headers=headers,
                 data=body,
+                proxies=outbound_proxies(url),
                 timeout=60,
             )
         except requests.RequestException as e:

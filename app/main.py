@@ -1,13 +1,16 @@
 import os
 import json
 import logging
+import threading
 
 import requests
 from flask import Flask, request, Response, jsonify
 
 from msgqueue import init_db, enqueue, get_item
+from outbound import outbound_proxies
 from worker import DeliveryWorker
 from ratelimiter import RateLimiterSet
+from relay import forward_relay, relay_enabled, relay_path
 
 app = Flask(__name__)
 
@@ -27,24 +30,27 @@ logging.basicConfig(
 )
 
 _worker_started = False
+_worker_lock = threading.Lock()
 
 
 def _start_worker():
     global _worker_started
-    if _worker_started:
-        return
-    init_db()
-    rate_limiter = RateLimiterSet()
-    worker = DeliveryWorker(API_BASE_URL, rate_limiter)
-    worker.start()
-    _worker_started = True
+    with _worker_lock:
+        if _worker_started:
+            return
+        init_db()
+        rate_limiter = RateLimiterSet()
+        worker = DeliveryWorker(API_BASE_URL, rate_limiter)
+        worker.start()
+        _worker_started = True
 
 
 def _token_from_path(path):
     if path.startswith("bot"):
         token = path.split("/")[0][3:]
     elif path.startswith("file/bot"):
-        token = path.split("/")[2]
+        parts = path.split("/")
+        token = parts[1][3:] if len(parts) > 1 else ""
     else:
         token = ""
     return token
@@ -71,8 +77,6 @@ def _extract_chat_info(body):
 
 def _forward_sync(path):
     url = f"{API_BASE_URL}/{path}"
-    if request.query_string:
-        url += f"?{request.query_string.decode()}"
 
     headers = {k: v for k, v in request.headers if k.lower() not in HOP_BY_HOP}
     headers.pop("X-Forwarded-For", None)
@@ -86,6 +90,7 @@ def _forward_sync(path):
             data=request.get_data(),
             params=request.args,
             cookies=request.cookies,
+            proxies=outbound_proxies(url),
             stream=True,
             timeout=60,
         )
@@ -133,6 +138,7 @@ def hook():
             url=HOOK_ENDPOINT,
             headers=headers,
             data=request.get_data(),
+            proxies=outbound_proxies(HOOK_ENDPOINT),
             timeout=60,
         )
     except requests.RequestException as e:
@@ -150,22 +156,26 @@ def hook():
 
 @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 def proxy(path):
-    _start_worker()
-
     token = _token_from_path(path)
     if token and ALLOWED_TOKENS and token not in ALLOWED_TOKENS:
         return Response("unauthorized token", status=403)
 
-    bypass = request.headers.get("X-Bypass-Queue", "")
-    if bypass or request.method in ("GET", "HEAD"):
+    queue_requested = request.headers.get("X-Queue-Request", "").strip().lower()
+    queue_requested = queue_requested in {"1", "true", "yes", "on"}
+    if not queue_requested or request.method in ("GET", "HEAD"):
         return _forward_sync(path)
 
+    if os.environ.get("QUEUE_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        return Response("queue mode is disabled", status=503)
+
+    _start_worker()
     body = _parse_body()
     chat_id, chat_type = _extract_chat_info(body)
 
     headers = {k: v for k, v in request.headers if k.lower() not in HOP_BY_HOP}
     headers.pop("X-Forwarded-For", None)
     headers.pop("X-Bypass-Queue", None)
+    headers.pop("X-Queue-Request", None)
 
     item_id = enqueue(
         method=request.method,
@@ -193,11 +203,26 @@ def status(item_id):
 
 @app.route("/")
 def root():
-    return {"status": "proxy running"}
+    return {
+        "status": "proxy running",
+        "relay": "enabled" if relay_enabled() else "disabled",
+    }
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
+
+
+app.add_url_rule(
+    relay_path(),
+    endpoint="relay",
+    view_func=forward_relay,
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+)
 
 
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", 5000))
-    _start_worker()
     app.run(host=host, port=port, debug=False)
