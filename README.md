@@ -86,6 +86,7 @@ Configure exact upstream host allowlists per provider:
 
 ```env
 RELAY_ALLOWED_HOSTS_YOUTUBE=oauth2.googleapis.com,www.googleapis.com
+RELAY_ALLOWED_HOSTS_INSTAGRAM=zigzal.app
 RELAY_ALLOWED_HOSTS_TELEGRAM=api.telegram.org
 RELAY_ALLOWED_HOSTS_WHATSAPP=graph.facebook.com
 ```
@@ -183,6 +184,7 @@ SOCIAL_RELAY_ALLOW_HTTP=false
 
 YOUTUBE_EGRESS_MODE=relay
 TELEGRAM_EGRESS_MODE=relay
+ZIGZAL_EGRESS_MODE=relay
 
 EITAA_EGRESS_MODE=none
 RUBIKA_EGRESS_MODE=none
